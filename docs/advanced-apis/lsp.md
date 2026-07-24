@@ -407,11 +407,11 @@ const handle = lsp.workers.createTransport({
 - Starts a `Worker` from `url`
 - Posts an optional `configure` payload
 - Resolves `ready` when the worker sends `{ kind: "ready" }`
+- Rejects `ready` when the worker sends `{ kind: "error" }`, fires `onerror`, or hits the startup timeout
 - Forwards JSON-RPC **string** messages between CodeMirror and the worker
 - Dispatches `{ kind: "host-request" }` to `hostHandlers` and replies with `{ kind: "host-response" }`
 - Forwards `{ kind: "log" }` / `{ kind: "status" }` to Acode's LSP logs
-- Rejects `ready` if the worker errors or the startup timeout elapses
-- Terminates the worker on `dispose()`
+- Terminates the worker on `dispose()` or on `{ kind: "error" }`
 
 ### `lsp.workers.createTransport(options)`
 
@@ -443,11 +443,19 @@ Returns a `TransportHandle`:
 }
 ```
 
-**Ready** (worker → main):
+**Ready** (worker → main) after successful initialization:
 
 ```js
 { kind: "ready" }
 ```
+
+**Error** (worker → main) if initialization fails — rejects `ready` immediately and tears down the worker:
+
+```js
+{ kind: "error", message: "Failed to initialize worker" }
+```
+
+Prefer this over throwing from the configure path. An uncaught rejection does not always surface as `Worker.onerror`, so the host would otherwise wait until `startupTimeout`.
 
 **JSON-RPC** as strings in both directions (no LSP headers):
 

@@ -18,11 +18,12 @@ The public module exposes:
 - `servers.*`: Server registry inspection and updates.
 - `bundles.*`: Bundle registry inspection.
 - `runtimes.*`: Runtime provider registry helpers.
+- `workers.createTransport(options)`: Web Worker LSP transport. <Badge type="tip" text="v1002+" />
 - `registerRuntimeProvider(provider)`: Alias for `runtimes.register(provider)`.
 - `unregisterRuntimeProvider(id)`: Alias for `runtimes.unregister(id)`.
 - `clientManager.*`: Limited client-manager access for advanced plugins.
 
-Most plugins should use `defineServer()` plus `upsert()`. Use raw server manifests only when you need fields that the helper does not cover, such as `runtimes`.
+Most plugins should use `defineServer()` plus `upsert()`. Use a custom runtime when the server does not run through the built-in Alpine/AXS path (for example a plugin-bundled Web Worker).
 
 ## Server Setup
 
@@ -66,7 +67,7 @@ Acode's CodeMirror LSP client talks to language servers through a transport obje
 
 - `transport.kind: "websocket"` connects to a WebSocket URL or to an auto-discovered AXS bridge port.
 - `transport.kind: "stdio"` is not a direct editor-to-process pipe. It still resolves through the WebSocket transport layer and needs a bridge URL or a runtime-provided dynamic port.
-- `transport.kind: "external"` is for custom transport factories.
+- `transport.kind: "external"` is for custom transport factories and runtime-provided handles (for example Web Worker language services).
 
 ::: warning
 Do not register a plain stdio process and expect Acode to pipe directly to it from the editor. For local servers, use `defineServer()` with `command` and `args`, or provide a `launcher.bridge` manually.
@@ -363,27 +364,221 @@ Higher `priority` values are tried first. Provider ids are normalized to lowerca
 
 ### Register a Server for a Runtime
 
-The `runtimes` field restricts a server to specific runtime provider ids. `defineServer()` does not currently preserve `runtimes`, so use a raw server manifest for runtime-specific servers.
+The `runtimes` field restricts a server to specific runtime provider ids. Pass it through `defineServer()` or a raw server manifest.
 
 ```js
 const lsp = acode.require("lsp");
 
-lsp.upsert({
-  id: "termux-typescript",
-  label: "TypeScript (Termux)",
-  languages: ["javascript", "typescript", "jsx", "tsx"],
-  enabled: true,
-  runtimes: ["termux"],
-  useWorkspaceFolders: true,
-  transport: {
-    kind: "stdio",
-    command: "typescript-language-server",
-    args: ["--stdio"],
-  },
-});
+lsp.upsert(
+  lsp.defineServer({
+    id: "termux-typescript",
+    label: "TypeScript (Termux)",
+    languages: ["javascript", "typescript", "jsx", "tsx"],
+    runtimes: ["termux"],
+    useWorkspaceFolders: true,
+    transport: {
+      kind: "stdio",
+      command: "typescript-language-server",
+      args: ["--stdio"],
+    },
+  }),
+);
 ```
 
 If `runtimes` is omitted, any registered provider whose `canHandle()` returns `true` may be selected. Use `runtimes` when your plugin owns both the runtime and the server definition.
+
+## Worker Transport <Badge type="tip" text="v1002+" />
+
+Creates a CodeMirror-compatible LSP transport backed by a Web Worker. Available from Acode **versionCode `1002`**. Set `"minVersionCode": 1002` in `plugin.json` when your plugin depends on it.
+
+```js
+const handle = lsp.workers.createTransport({
+  url,
+  name,
+  serverId,
+  startupTimeout,
+  configure,
+  hostHandlers,
+});
+```
+
+### What it does
+
+- Starts a `Worker` from `url`
+- Posts an optional `configure` payload
+- Resolves `ready` when the worker sends `{ kind: "ready" }`
+- Forwards JSON-RPC **string** messages between CodeMirror and the worker
+- Dispatches `{ kind: "host-request" }` to `hostHandlers` and replies with `{ kind: "host-response" }`
+- Forwards `{ kind: "log" }` / `{ kind: "status" }` to Acode's LSP logs
+- Rejects `ready` if the worker errors or the startup timeout elapses
+- Terminates the worker on `dispose()`
+
+### `lsp.workers.createTransport(options)`
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `url` | `string` | Required. Absolute or app-relative URL of the worker script. |
+| `name` | `string` | Optional worker name and default log identity. |
+| `serverId` | `string` | Optional id for LSP logs and errors. Defaults to `name`. |
+| `startupTimeout` | `number` | Milliseconds to wait for `{ kind: "ready" }`. Default `10000`. |
+| `configure` | `object` | Optional message posted right after the worker starts. |
+| `hostHandlers` | `Record<string, (params) => unknown \| Promise<unknown>>` | Handlers for worker host requests, keyed by method name. |
+
+Returns a `TransportHandle`:
+
+- `transport`: `{ send, subscribe, unsubscribe }`
+- `ready`: `Promise<void>`
+- `dispose()`: cleanup and `worker.terminate()`
+
+### Worker protocol
+
+**Configure** (main → worker), optional:
+
+```js
+{
+  kind: "configure",
+  serverId: "my-worker-server",
+  rootUri: "file:///path/to/project",
+  initializationOptions: {},
+}
+```
+
+**Ready** (worker → main):
+
+```js
+{ kind: "ready" }
+```
+
+**JSON-RPC** as strings in both directions (no LSP headers):
+
+```js
+// main → worker / worker → main
+JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })
+```
+
+**Host request** (worker → main):
+
+```js
+// Nested params
+{
+  kind: "host-request",
+  id: 1,
+  method: "readFile",
+  params: { uri: "file:///path/to/file.css" },
+}
+
+// Flat fields also work
+{
+  kind: "host-request",
+  id: 1,
+  method: "readFile",
+  uri: "file:///path/to/file.css",
+}
+```
+
+**Host response** (main → worker):
+
+```js
+{ kind: "host-response", id: 1, result: "..." }
+// or
+{ kind: "host-response", id: 1, error: "message" }
+```
+
+Nested `params` and flat fields are both normalized into the object passed to `hostHandlers[method]`. Thrown handler errors become `error` on the response.
+
+**Optional logs** (worker → main):
+
+```js
+{ kind: "log", level: "info", message: "Loaded project" }
+{ kind: "status", message: "Scanning workspace" }
+```
+
+### Example
+
+```js
+const lsp = acode.require("lsp");
+const RUNTIME_ID = "my-css-web-worker";
+const SERVER_ID = "my-css-worker";
+
+function createRuntime(workerBaseUrl) {
+  const workerUrl = new URL("language.worker.js", workerBaseUrl).href;
+
+  return {
+    id: RUNTIME_ID,
+    label: "My CSS Web Worker",
+    priority: 200,
+
+    canHandle(server) {
+      return server.id === SERVER_ID && typeof Worker !== "undefined";
+    },
+
+    resolveUris(_server, context) {
+      return {
+        documentUri: context.originalDocumentUri,
+        rootUri: context.originalRootUri,
+        scope: "workspace",
+      };
+    },
+
+    async checkInstallation() {
+      return {
+        status: "present",
+        version: "bundled",
+        canInstall: false,
+        canUpdate: false,
+      };
+    },
+
+    async start(server, context) {
+      const handle = lsp.workers.createTransport({
+        url: workerUrl,
+        name: "my-css-language-service",
+        serverId: server.id,
+        startupTimeout: server.startupTimeout ?? 20_000,
+        configure: {
+          kind: "configure",
+          serverId: server.id,
+          rootUri: context.originalRootUri ?? context.rootUri ?? null,
+          initializationOptions: server.initializationOptions ?? {},
+        },
+        hostHandlers: {
+          async readFile(params) {
+            const fs = acode.require("fs")(String(params.uri ?? ""));
+            if (!fs) throw new Error(`No filesystem provider for ${params.uri}`);
+            return String(await fs.readFile("utf-8"));
+          },
+        },
+      });
+
+      return {
+        kind: "transport",
+        providerId: RUNTIME_ID,
+        transport: handle,
+      };
+    },
+  };
+}
+
+lsp.runtimes.register(createRuntime(baseUrl));
+lsp.upsert(
+  lsp.defineServer({
+    id: SERVER_ID,
+    label: "My CSS (Web Worker)",
+    languages: ["html", "css"],
+    runtimes: [RUNTIME_ID],
+    transport: { kind: "external" },
+    useWorkspaceFolders: true,
+    enabled: true,
+    startupTimeout: 20_000,
+  }),
+);
+
+// On unmount
+lsp.servers.unregister(SERVER_ID);
+lsp.runtimes.unregister(RUNTIME_ID);
+```
+
+Use `transport: { kind: "external" }` for worker servers — the runtime returns the real transport handle. Register your own server id; do not replace built-in ids like `html`, `css`, `json`, or `typescript`.
 
 ### Runtime URI Resolution
 
@@ -441,7 +636,7 @@ It may return `scope: "workspace"` or `scope: "document"`. Document scope starts
 
 ### `defineServer(options)`
 
-Convenience helper for local bridge-backed servers.
+Convenience helper for local bridge-backed servers (and worker-backed servers when combined with a custom runtime).
 
 Supported fields:
 
@@ -450,6 +645,7 @@ Supported fields:
 - `languages`: Required non-empty language id array.
 - `enabled`: Defaults to `true`.
 - `useWorkspaceFolders`: Use one client per server and workspace folders. Useful for TypeScript and Rust.
+- `runtimes`: Optional preferred runtime provider ids for this server (for example `["web-worker"]` or a plugin runtime id).
 - `command`: Executable used for the AXS bridge.
 - `args`: Arguments passed to `command`.
 - `transport`: Optional partial transport descriptor. Defaults to `{ kind: "websocket" }`.
@@ -596,6 +792,36 @@ Available methods:
 - `lsp.runtimes.list()`
 - `lsp.runtimes.select(server, context?)`
 
+### Workers <Badge type="tip" text="v1002+" />
+
+```js
+const handle = lsp.workers.createTransport({
+  url: "https://localhost/plugins/my-plugin/language.worker.js",
+  name: "my-language-worker",
+  serverId: "my-worker-server",
+  startupTimeout: 15_000,
+  configure: {
+    kind: "configure",
+    serverId: "my-worker-server",
+    rootUri: "file:///project",
+  },
+  hostHandlers: {
+    async readFile(params) {
+      const fs = acode.require("fs")(String(params.uri ?? ""));
+      return String(await fs.readFile("utf-8"));
+    },
+  },
+});
+
+await handle.ready;
+handle.transport.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+handle.dispose();
+```
+
+Available methods:
+
+- `lsp.workers.createTransport(options)`
+
 ## Client Manager
 
 The public client manager API is intentionally small.
@@ -616,13 +842,34 @@ Available methods:
 
 ## Important Types
 
+### `LspMessageTransport`
+
+CodeMirror-compatible JSON-RPC transport used by `TransportHandle.transport`.
+
+- `send(message: string): void`
+- `subscribe(handler: (message: string) => void): void`
+- `unsubscribe(handler: (message: string) => void): void`
+
+Messages contain only JSON-RPC payloads as strings (no LSP Content-Length headers).
+
 ### `TransportHandle`
 
-Object returned by transport factories.
+Object returned by transport factories and by `lsp.workers.createTransport()`.
 
-- `transport`: CodeMirror LSP transport object.
+- `transport`: `LspMessageTransport`
 - `dispose`: Function that cleans up the transport.
 - `ready`: `Promise<void>` that resolves when the transport is ready.
+
+### `LspWorkerTransportOptions` <Badge type="tip" text="v1002+" />
+
+Options for `lsp.workers.createTransport(options)`:
+
+- `url`
+- `name?`
+- `serverId?`
+- `startupTimeout?`
+- `configure?`
+- `hostHandlers?`
 
 ### `LspRuntimeConnection`
 
@@ -666,9 +913,10 @@ Context passed to runtime providers.
 ## Best Practices
 
 - Use `lsp.upsert()` during plugin initialization.
-- Use `defineServer()` for ordinary local servers.
-- Use a raw manifest when you need `runtimes` or a custom `launcher`.
+- Use `defineServer()` for ordinary local servers, including `runtimes` when you own a custom runtime.
 - Prefer structured installers over shell installers.
 - Use `useWorkspaceFolders: true` for heavy workspace-aware servers.
 - If the server cannot see Acode's file paths, define `documentUri` and usually `rootUri`.
 - Runtime plugins should register their own server definitions instead of taking over built-in Acode server ids.
+- For Web Worker language services, use `lsp.workers.createTransport()` <Badge type="tip" text="v1002+" />.
+- Set `minVersionCode` to `1002` when your plugin requires the worker transport API.

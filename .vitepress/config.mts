@@ -247,6 +247,10 @@ export default defineConfig({
 									link: "/docs/editor-components/file-list",
 								},
 								{
+									text: "File Index",
+									link: "/docs/editor-components/file-index",
+								},
+								{
 									text: "Page",
 									link: "/docs/editor-components/page",
 								},

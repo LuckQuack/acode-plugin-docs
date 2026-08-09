@@ -52,6 +52,11 @@ Both methods are equivalent and accept & return the same parameters.
 | content | string \|  [HTMLElement](https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement) | Custom content element or HTML string. Strings are sanitized using DOMPurify | - |
 | stylesheets | `string\|string[]` | Custom stylesheets for tab. Can be URL, or CSS string | - |
 | hideQuickTools | `boolean` | Whether to hide quicktools for this tab | `false` |
+| pinned | `boolean` | Pin the tab to prevent accidental closing | `false` |
+| readOnly | `boolean` | Open the file as read-only | `false` |
+| paneId | `string` | Target editor pane id (multi-pane layout) | - |
+| pane | `object` | Target editor pane instance (multi-pane layout) | - |
+| isPanePlaceholder | `boolean` | Temporary empty tab for an empty pane | `false` |
 
 ## Properties
 

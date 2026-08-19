@@ -213,6 +213,10 @@ export default defineConfig({
 									link: "/docs/utilities/editor-themes",
 								},
 								{
+									text: "Code Highlight",
+									link: "/docs/utilities/code-highlight",
+								},
+								{
 									text: "Encoding",
 									link: "/docs/utilities/encoding",
 								},
